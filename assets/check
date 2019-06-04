@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -x -e -u -o pipefail -o errtrace
+set -e -u -o pipefail -o errtrace
 
 exec 3>&1 # make stdout available as fd 3 for the result
 exec 1>&2 # redirect all output to stderr for logging
@@ -19,8 +19,10 @@ password=$(jq -r '.source.password // ""' < "${payload}")
 project=$(jq -r '.source.project // ""' < "${payload}")
 repository=$(jq -r '.source.repository // ""' < "${payload}")
 limit=$(jq -r '.source.limit // "100"' < "${payload}")
+source_branch=$(jq -r '.source.branch // ""' < ${payload})
 
 version_updated_at=$(jq -r '.version.updated_at // 0' < "${payload}")
+version_commit=$(jq -r '.version.commit // ""' < ${payload})
 
 if [ -z "${base_url:-}" ]; then
     echo "error: source.base_url can't be empty"
@@ -39,16 +41,23 @@ fi
 
 # Bitbucket Cloud and (self-hosted) Server APIs are a bit different
 if [ "${bitbucket_type}" == "server" ]; then
-    uri="${base_url}/rest/api/1.0/projects/${project}/repos/${repository}/pull-requests?limit=${limit}&state=open"
+    if [[ -n "${source_branch}" ]]; then
+        branch_param="&at=refs/heads/${source_branch}"
+    else
+        branch_param=""
+    fi
+    uri="${base_url}/rest/api/1.0/projects/${project}/repos/${repository}/pull-requests?limit=${limit}&state=open${branch_param}"
 
     curl -s --fail -u "${username}:${password}" "${uri}" | jq -r \
+        | jq -r --arg version_updated_at "${version_updated_at}" --arg version_commit $version_commit \
         '.values
         | map({
-            id: .id | tostring, 
+            id: .id | tostring,
             branch: .fromRef.id | tostring | (capture("refs/heads/(?<branch>.+)").branch // .),
-            commit: .fromRef.latestCommit, 
+            commit: .fromRef.latestCommit,
             updated_at: .updatedDate | tostring
-        }) 
+        })
+        | map(select(.commit != $version_commit))
         | map(select(.updated_at >= "${version_updated_at}"))
         | sort_by(.updated_at)' >&3
 elif [ "${bitbucket_type}" == "cloud" ]; then
@@ -57,18 +66,40 @@ elif [ "${bitbucket_type}" == "cloud" ]; then
     # write response to file as feeding it to jq from a variable doesnt work properly: JSON loses linefeed format in variable
     response=$(mktemp "${TMPDIR}/bitbucket-pullrequest-resource-check.XXXXXX")
     curl -s --fail -u "${username}:${password}" "${uri}" | jq -r '.values' > "${response}"
-
     prs="[]"
     while read -r pullrequest; do
         branch=$(echo "${pullrequest}" | jq -r '.source.branch.name')
+        destination_branch=$(echo "${pullrequest}" | jq -r '.destination.branch.name')
+
+        if [[ "${source_branch}" ]]; then
+            [[ "${destination_branch}" == "${source_branch}" ]] || continue
+        fi
+
         id=$(echo "${pullrequest}" | jq -r '.id')
         commit=$(echo "${pullrequest}" | jq -r '.source.commit.hash')
-        commit_url=$(echo "${pullrequest}" | jq -r '.source.commit.links.self.href')
 
+        if [[ "${version_commit}" ]]; then
+            if [[ "${commit}" == "${version_commit}" ]]; then
+               continue
+            fi
+        fi
+        commit_url=$(echo "${pullrequest}" | jq -r '.source.commit.links.self.href')
+        # replace the stupid /!api with /api
+        commit_url=${commit_url//!api/api}
+
+        commit_data=$(curl -s --fail -u "${username}:${password}" "${commit_url}")
         # get the commit date, which is when the PR last got updated code-wise.
         # the updated_on field in the PR also changes when comment added etc
-        date=$(curl -s --fail -u "${username}:${password}" "${commit_url}" | jq -r '.date')        
-        
+        date=$(echo "$commit_data" | jq -r '.date')
+
+        commit_statuses=$(echo "$commit_data" | jq -r '.links.statuses.href')
+        commit_statuses=${commit_statuses//!api/api}
+
+        statuses=$(curl -s --fail -u "${username}:${password}" "${commit_statuses}")
+        status_count=$(echo "${statuses}" | jq -r '.values | length')
+        if [[ $status_count -gt 0 ]]; then
+          continue
+        fi
         prs+="+ [{id:\"${id}\", branch: \"${branch}\", commit:\"${commit}\", updated_at:\"${date}\"}]"
     done < <(jq -c '.[]' "${response}")
 
@@ -78,5 +109,5 @@ elif [ "${bitbucket_type}" == "cloud" ]; then
     fi
 
     # take the list of PRs | sort by update-date of commits | remove the date | pick latest PR, wrap as array for concourse
-    jq -n "[ $prs | sort_by(.updated_at) | map(del(.updated_at)) | .[-1] ]" >&3
+    jq -n "[$prs | sort_by(.updated_at) | map(del(.updated_at)) | .[-1]]" >&3
 fi
