@@ -75,10 +75,8 @@ change_build_status() {
     jq -n --argjson pr "${pr}" --argjson payload "${change_build_status_payload}" '{
         version: {
             id: $pr.id|tostring,
-            title: $pr.title,
             branch: $pr.feature_branch,
             commit: $pr.commit,
-            updated_at: $pr.updated_at
         },
         metadata: [
             {name: "state", value: $payload.state},
@@ -114,7 +112,6 @@ push() {
         '{
             version: {
                 id: $pr.id|tostring,
-                title: $pr.title,
                 branch: $pr.feature_branch,
                 commit: $git.version.ref
             },
